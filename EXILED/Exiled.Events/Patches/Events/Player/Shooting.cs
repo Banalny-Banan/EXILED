@@ -8,18 +8,16 @@
 namespace Exiled.Events.Patches.Events.Player
 {
     using System;
-    using System.Collections.Generic;
-    using System.Reflection;
-    using System.Reflection.Emit;
 
     using API.Features;
-    using API.Features.Pools;
     using Exiled.Events.Attributes;
     using Exiled.Events.EventArgs.Player;
     using HarmonyLib;
+    using InventorySystem.Items.Firearms;
     using InventorySystem.Items.Firearms.Modules.Misc;
-
-    using static HarmonyLib.AccessTools;
+    using PlayerRoles.FirstPersonControl;
+    using RelativePositioning;
+    using UnityEngine;
 
     /// <summary>
     /// Patches <see cref="Player" />.
@@ -27,94 +25,55 @@ namespace Exiled.Events.Patches.Events.Player
     /// </summary>
     [EventPatch(typeof(Handlers.Player), nameof(Handlers.Player.Shooting))]
 
+    // public void ProcessShot(Firearm firearm, Action<ReferenceHub> processingMethod)
     [HarmonyPatch(typeof(ShotBacktrackData), nameof(ShotBacktrackData.ProcessShot))]
     internal static class Shooting
     {
-        private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions, ILGenerator generator)
+#pragma warning disable SA1313
+        private static bool Prefix(Firearm firearm, Action<ReferenceHub> processingMethod, ShotBacktrackData __instance)
+#pragma warning restore SA1313
         {
-            List<CodeInstruction> newInstructions = ListPool<CodeInstruction>.Pool.Get(instructions);
+            if (!WaypointBase.TryGetWaypoint(__instance.RelativeOwnerPosition.WaypointId, out WaypointBase wp))
+                return false;
 
-            Label returnLabel = generator.DefineLabel();
+            double lagCompensation = 0.0;
 
-            /*
-            [] <= Here
-            IL_0078: ldarg.2      // processingMethod
-            IL_0079: ldarg.0      // this
-            IL_007a: ldfld        class ReferenceHub InventorySystem.Items.Firearms.Modules.Misc.ShotBacktrackData::PrimaryTargetHub
-            IL_007f: callvirt     instance void class [mscorlib]System.Action`1<class ReferenceHub>::Invoke(!0/*class ReferenceHub* /)
-             */
-            int hasTargetIndex = newInstructions.FindIndex(instruction => instruction.IsLdarg(2));
+            if (firearm.Owner != null)
+                lagCompensation = firearm.Owner.connectionToClient.rtt / 2.0;
 
-            /*
-            [] <= Here
-            IL_0092: ldarg.2      // processingMethod
-            IL_0093: ldnull       // null
-            IL_0094: callvirt     instance void class [mscorlib]System.Action`1<class ReferenceHub>::Invoke(!0/*class ReferenceHub* /)
-             */
-            int noTargetIndex = newInstructions.FindIndex(hasTargetIndex + 1, instruction => instruction.IsLdarg(2));
-            List<Label> noTargetLabels = newInstructions[noTargetIndex].ExtractLabels();
-
-            ConstructorInfo constructorInfo = Constructor(
-                typeof(ShootingEventArgs),
-                new[] { typeof(InventorySystem.Items.Firearms.Firearm), typeof(ShotBacktrackData).MakeByRefType() });
-
-            Label continueLabel1 = generator.DefineLabel();
-
-            CodeInstruction[] noTargetInstructions =
+            using (new WaypointBacktracker(wp, lagCompensation))
             {
-                // ShootingEventArgs ev = new(firearm, this)
-                new(OpCodes.Ldarg_1),
-                new(OpCodes.Ldarg_0),
-                new(OpCodes.Newobj, constructorInfo),
+                Vector3 worldspacePosition = wp.GetWorldspacePosition(__instance.RelativeOwnerPosition.Relative);
+                Quaternion worldspaceRotation = wp.GetWorldspaceRotation(__instance.RelativeOwnerRotation);
 
-                // Handlers.Player.OnShooting(ev)
-                new(OpCodes.Dup), // Dup to keep ev on the stack
-                new(OpCodes.Call, Method(typeof(Handlers.Player), nameof(Handlers.Player.OnShooting))),
+                using (new FpcBacktracker(firearm.Owner, worldspacePosition, worldspaceRotation))
+                {
+                    if (__instance.HasPrimaryTarget)
+                    {
+                        using (new WaypointBacktracker(__instance.PrimaryTargetRelativePosition.WaypointId, lagCompensation))
+                        {
+                            using (new FpcBacktracker(__instance.PrimaryTargetHub, __instance.PrimaryTargetRelativePosition.Position))
+                            {
+                                ShootingEventArgs args = new(firearm, ref __instance);
+                                Handlers.Player.OnShooting(args);
 
-                // if (!ev.IsAllowed) return
-                new(OpCodes.Callvirt, PropertyGetter(typeof(ShootingEventArgs), nameof(ShootingEventArgs.IsAllowed))),
-                new(OpCodes.Brtrue_S, continueLabel1),
+                                if (args.IsAllowed)
+                                    processingMethod(__instance.PrimaryTargetHub);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        ShootingEventArgs args = new(firearm, ref __instance);
+                        Handlers.Player.OnShooting(args);
 
-                new(OpCodes.Leave_S, returnLabel),
-                new CodeInstruction(OpCodes.Nop).WithLabels(continueLabel1),
-            };
+                        if (args.IsAllowed)
+                            processingMethod(null);
+                    }
+                }
+            }
 
-            Label continueLabel2 = generator.DefineLabel();
-
-            CodeInstruction[] hasTargetInstructions =
-            {
-                // ShootingEventArgs ev = new(firearm, this)
-                new(OpCodes.Ldarg_1),
-                new(OpCodes.Ldarg_0),
-                new(OpCodes.Newobj, constructorInfo),
-
-                // Handlers.Player.OnShooting(ev)
-                new(OpCodes.Dup), // Dup to keep ev on the stack
-                new(OpCodes.Call, Method(typeof(Handlers.Player), nameof(Handlers.Player.OnShooting))),
-
-                // if (!ev.IsAllowed) return
-                new(OpCodes.Callvirt, PropertyGetter(typeof(ShootingEventArgs), nameof(ShootingEventArgs.IsAllowed))),
-                new(OpCodes.Brtrue_S, continueLabel2),
-
-                new(OpCodes.Leave_S, returnLabel),
-                new CodeInstruction(OpCodes.Nop).WithLabels(continueLabel2),
-            };
-
-            newInstructions.InsertRange( // noTargetIndex goes first because it's higher then hasTargetIndex so it won't mess it up
-                noTargetIndex,
-                noTargetInstructions);
-            newInstructions[noTargetIndex].WithLabels(noTargetLabels);
-
-            newInstructions.InsertRange(
-                hasTargetIndex,
-                hasTargetInstructions);
-
-            newInstructions[newInstructions.Count - 1].WithLabels(returnLabel);
-
-            for (int z = 0; z < newInstructions.Count; z++)
-                yield return newInstructions[z];
-
-            ListPool<CodeInstruction>.Pool.Return(newInstructions);
+            return false;
         }
     }
 }
